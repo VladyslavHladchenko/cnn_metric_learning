@@ -1,0 +1,3 @@
+[submodule "cnn_workflow"]
+	path = cnn_workflow
+	url = git@github.com:VladyslavHladchenko/cnn_workflow.git

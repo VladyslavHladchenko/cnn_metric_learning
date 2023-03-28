@@ -12,13 +12,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pickle
+import heapq as hq
+from dataclasses import dataclass, field
+from typing import Any
 
 from tools import *
 from optparse import OptionParser
 
-# query if we have GPU
-dev = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-print('Using device:', dev)
+from cnn_workflow.utils import get_free_device, add_model_note
+from cnn_workflow import cnn_workflow
+
+dev = get_free_device()
 
 # Global datasets
 transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
@@ -60,6 +64,42 @@ class ConvNet(nn.Sequential):
         f = nn.Sequential(*self.layers[:-1]).forward(x)
         f = nn.functional.normalize(f, p=2, dim=1)
         return f
+
+def get_closest_to_queries(net, queries, loader):
+    queries_features = net.features(queries)
+
+    xs = []
+    dists = []
+
+    for x,l in loader:
+        x,l = x.to(dev), l.to(dev)
+        xs.append(x)
+        features = net.features(x)
+        dists_ = distances(features, queries_features)
+        dists.append(dists_)
+
+    xs = torch.concat(xs, dim=0)
+    dists = torch.concat(dists, dim=0)
+    _, indices =  torch.sort(dists,0)
+
+    xs_sorted = xs[indices][:50]
+
+    return xs_sorted
+
+
+def plot_closest_to_queries(closest_images):
+    n_queries = closest_images.shape[1]
+    plt.clf()
+    f, axarr = plt.subplots(n_queries, 1, gridspec_kw = {'wspace':0, 'hspace':0})
+
+    for i in range(n_queries):
+        ax = axarr[i]
+        imgs = closest_images[:,i]
+        imgs = torch.concat(imgs.unbind(0),2)
+
+        ax.imshow(imgs.cpu().numpy().transpose(1, 2, 0))
+        ax.axis('off')
+        ax.axvline(x=27, color='w')
 
 
 def new_net():
@@ -114,6 +154,7 @@ def to_features(net, loader):
     labels = []
 
     for x,y in loader:
+        x,y = x.to(dev) ,y.to(dev)
         out = net.features(x)
         features.append(out)
         labels.append(y)
@@ -143,8 +184,10 @@ def evaluate_mAP(net, dataset: DataXY):
     features, flabels = to_features(net, loader)
 
     queries, qlabels = features[:n_queries], flabels[:n_queries]
+    queries, qlabels = queries.to(dev), qlabels.to(dev)
 
     for i, (q, ql) in enumerate(zip(queries, qlabels)):
+        q, ql = q.to(dev), ql.to(dev)
         dists = distances(q[None,...], features).squeeze(0)
         AP, Prec, Rec = evaluate_AP(torch.concat( [ dists[0:i], dists[i+1:]]).detach().cpu().numpy(),
                                     torch.concat( [ flabels[0:i], flabels[i+1:]]).detach().cpu().numpy(),
@@ -208,7 +251,7 @@ def train_class(net, train_loader, val_loader, epochs=20, name: str = None):
             torch.save(net.state_dict(), name)
 
 
-def triplet_loss(features: torch.Tensor, labels: torch.Tensor, alpha=0.5):
+def triplet_loss(features: torch.Tensor, labels: torch.Tensor, alpha=0.5, **kwargs):
     """
     triplet loss
     features [N, d] tensor of features for N data points
@@ -230,7 +273,7 @@ def triplet_loss(features: torch.Tensor, labels: torch.Tensor, alpha=0.5):
 
         d_p = d_p[d_p!=0]
         
-        all_pairs = torch.stack(torch.meshgrid(d_p, d_n)).T.reshape(-1,2)
+        all_pairs = torch.stack(torch.meshgrid(d_p, d_n)).reshape(2,-1).T
         
         L_a = F.relu(all_pairs[:,0] - all_pairs[:,1] + alpha).sum()
         L += L_a
@@ -238,25 +281,38 @@ def triplet_loss(features: torch.Tensor, labels: torch.Tensor, alpha=0.5):
     return L
 
 
-def train_triplets(net, train_loader, epochs=20, name: str = None):
+def train_triplets(net, data_loader, epochs=20, name: str = None):
     """
     training with triplet loss
     """
-    
-    opt = optim.Adam(net.parameters(), lr=0.01)
+    net.to(dev)
+    opt = optim.Adam(net.parameters(), lr=0.001)
 
-    for e in range(epochs):
-        for x,y in train_loader:
-            net.train()
+    add_model_note(net, name)
+
+    results = cnn_workflow.train(net, dev, data_loader, opt, loss_fn=triplet_loss, epoch_num=epochs, save_epochs=True, no_acc = True)
+
+    return results
+
+    # for e in range(epochs):
+    #     avg_loss = 0
+    #     for x,y in train_loader:
+    #         x,y = x.to(dev), y.to(dev)
+    #         net.train()
             
-            opt.zero_grad()
-            output = net(x)
+    #         opt.zero_grad()
+    #         output = net(x)
             
-            trn_loss = triplet_loss(output, y)
-            trn_loss.backward()
-            
-            opt.step()
-        print(f"epoch {e} trn loss {trn_loss}")
+    #         trn_loss = triplet_loss(output, y)
+    #         trn_loss.backward()
+    #         opt.step()
+    #         avg_loss+=trn_loss.item()
+
+    #         net.train()
+
+    #     avg_loss/=len(train_loader.dataset)
+
+    #     print(f"epoch {e} avg trn loss {avg_loss}")
 
 
 
